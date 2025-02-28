@@ -1,0 +1,11 @@
+version: '3'
+
+services:
+  chatwoot-botpress-bridge:
+    build:
+      context: .  # Assumes Dockerfile is in the same directory as docker-compose.yml
+      dockerfile: Dockerfile
+    restart: always
+    ports:
+      - '0.0.0.0:3100:3100'
+  
