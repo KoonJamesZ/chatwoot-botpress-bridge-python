@@ -3,7 +3,7 @@ import requests
 import os
 from flask_cors import CORS
 from dotenv import load_dotenv
-
+import json
 # Load environment variables from .env file
 load_dotenv()
 
@@ -11,17 +11,24 @@ app = Flask(__name__)
 CORS(app, resources={r"/*":{"origins":"*"}})
 
 # Configuration
-CHATWOOT_API_TOKEN = os.getenv("CHATWOOT_API_TOKEN")
+CHATWOOT_ADMIN_API_TOKEN = os.getenv("CHATWOOT_ADMIN_API_TOKEN")
+CHATWOOT_BOT_API_TOKEN = os.getenv("CHATWOOT_BOT_API_TOKEN")
 CHATWOOT_ACCOUNT_ID = os.getenv("CHATWOOT_ACCOUNT_ID")
 CHATWOOT_BASE_URL = os.getenv("CHATWOOT_BASE_URL")
 BOTPRESS_BASE_URL = os.getenv("BOTPRESS_BASE_URL")
 BOTPRESS_BOT_ID = os.getenv("BOTPRESS_BOT_ID")
 
 # Headers for API requests
-CHATWOOT_HEADERS = {
-    'api_access_token': CHATWOOT_API_TOKEN,
+CHATWOOT_ADMIN_HEADERS = {
+    'api_access_token': CHATWOOT_ADMIN_API_TOKEN,
     'Content-Type': 'application/json'
 }
+
+CHATWOOT_BOT_HEADERS = {
+    'api_access_token': CHATWOOT_BOT_API_TOKEN,
+    'Content-Type': 'application/json'
+}
+
 
 class ChatwootBotpressBridge:
     @staticmethod
@@ -54,7 +61,7 @@ class ChatwootBotpressBridge:
                 "content": message,
                 "message_type": "outgoing"
             }
-            response = requests.post(chatwoot_url, json=payload, headers=CHATWOOT_HEADERS)
+            response = requests.post(chatwoot_url, json=payload, headers=CHATWOOT_BOT_HEADERS)
             response.raise_for_status()
             return True
         except requests.exceptions.RequestException as e:
@@ -69,12 +76,42 @@ class ChatwootBotpressBridge:
             payload = {
                         "status": status
                         }
-            response = requests.post(toggle_url, json=payload, headers=CHATWOOT_HEADERS)
+            response = requests.post(toggle_url, json=payload, headers=CHATWOOT_ADMIN_HEADERS)
             response.raise_for_status()
             return True
             
         except requests.exceptions.RequestException as e:
             app.logger.error(f"Chatwoot conversation update error: {str(e)}")
+            return False
+    
+    @staticmethod
+    def assign_conversation_to_human(conversation_id):
+        """Set the conversation to unassigned by removing any assigned agent"""
+        try:
+            assignment_url = f"{CHATWOOT_BASE_URL}/api/v1/accounts/{CHATWOOT_ACCOUNT_ID}/conversations/{conversation_id}/assignments"
+            payload = {
+                "assignee_id": 1  # ID of Human agent
+            }
+            response = requests.post(assignment_url, json=payload, headers=CHATWOOT_ADMIN_HEADERS)
+            response.raise_for_status()
+            return True
+        except requests.exceptions.RequestException as e:
+            app.logger.error(f"Chatwoot assignment update error: {str(e)}")
+            return False
+    
+    @staticmethod
+    def assign_conversation_to_bot(conversation_id):
+        """Set the conversation to unassigned by removing any assigned agent"""
+        try:
+            assignment_url = f"{CHATWOOT_BASE_URL}/api/v1/accounts/{CHATWOOT_ACCOUNT_ID}/conversations/{conversation_id}/assignments"
+            payload = {
+                "assignee_id": None  # ID of bot agent
+            }
+            response = requests.post(assignment_url, json=payload, headers=CHATWOOT_ADMIN_HEADERS)
+            response.raise_for_status()
+            return True
+        except requests.exceptions.RequestException as e:
+            app.logger.error(f"Chatwoot assignment update error: {str(e)}")
             return False
 
 # Initialize the bridge
@@ -85,50 +122,57 @@ bridge = ChatwootBotpressBridge()
 def chatwoot_webhook():
     try:
         data = request.json
-        # print(data)
+        # print(json.dumps(data, indent=2,ensure_ascii=False))
         # Extract necessary information from the webhook payload
         message_type = data.get('message_type') # incoming (message from user) or outgoing (message from admin)
         content = data.get('content') # Message content
         conversation = data.get('conversation', {})# Conversation details
         conversation_id = conversation.get('id')
-        # print(conversation_id)
+        conversation_assignee = conversation.get('meta', {}).get('assignee')
 
-        # Only process pending conversations (pending status means the conversation is not yet assigned to an agent)
+        # Resolve the conversation if it is marked as resolved and assign it to bot
+        if data.get('event','') == "conversation_resolved":
+            conversation_id = data.get('id')
+            bridge.assign_conversation_to_bot(conversation_id)
+            return jsonify({"status": "success", "message": "Conversation resolved"}), 200
+        
+        # Change Status of conversation to open if it is pending
         if conversation.get('status','') == "pending":
-            # Only process incoming messages from user
-            if message_type == 'incoming':
-                # Get response from Botpress
-                bot_response = bridge.send_to_botpress(content, conversation_id)
-                
-                # Handle the handoff case
-                if bot_response == "handoff":
-                    # First send the message to the user
-                    handoff_message = "Please wait while I connect you to a human agent"
-                    if bridge.send_to_chatwoot(conversation_id, handoff_message):
-                        # Then update the conversation status to open
-                        if bridge.update_conversation_status(conversation_id, "open"):
-                            return jsonify({"status": "success", "message": "Handoff processed successfully"}), 200
-                        else:
-                            return jsonify({"status": "error", "message": "Failed to update conversation status"}), 500
-                    else:
-                        return jsonify({"status": "error", "message": "Failed to send handoff message"}), 500
-                
-                # Handle normal bot responses
-                if not bot_response:
-                    return jsonify({"status": "error", "message": "Failed to get Botpress response"}), 500
+            bridge.update_conversation_status(conversation_id, "open")
 
-                # Send the response back to Chatwoot
-                if bridge.send_to_chatwoot(conversation_id, bot_response):
-                    return jsonify({"status": "success", "message": "Message processed successfully"}), 200
+        
+        # Only process incoming messages from user
+        if message_type == 'incoming' and conversation_assignee is None:
+            # Get response from Botpress
+            bot_response = bridge.send_to_botpress(content, conversation_id)
+            
+            # Handle the handoff case
+            if bot_response == "handoff":
+                # First send the message to the user
+                handoff_message = "Please wait while I connect you to a human agent"
+                if bridge.send_to_chatwoot(conversation_id, handoff_message):
+                    # Then update the conversation status to open
+                    if bridge.assign_conversation_to_human(conversation_id):
+                        return jsonify({"status": "success", "message": "Handoff processed successfully"}), 200
+                    else:
+                        return jsonify({"status": "error", "message": "Failed to update conversation status"}), 500
                 else:
-                    return jsonify({"status": "error", "message": "Failed to send message to Chatwoot"}), 500
+                    return jsonify({"status": "error", "message": "Failed to send handoff message"}), 500
             
-            # Only process outgoing messages from admin (message_type = outgoing)
+            # Handle normal bot responses
+            if not bot_response:
+                return jsonify({"status": "error", "message": "Failed to get Botpress response"}), 500
+
+            # Send the response back to Chatwoot
+            if bridge.send_to_chatwoot(conversation_id, bot_response):
+                return jsonify({"status": "success", "message": "Message processed successfully"}), 200
             else:
-                return jsonify({"status": "ignored", "reason": "not an incoming message"}), 200
-            
+                return jsonify({"status": "error", "message": "Failed to send message to Chatwoot"}), 500
+        
+        # Only process outgoing messages from admin (message_type = outgoing)
         else:
-            return jsonify({"status": "success", "message": "Message processed successfully"}), 200
+            return jsonify({"status": "ignored", "reason": "not an incoming message"}), 200
+            
     except Exception as e:
         app.logger.error(f"Error processing webhook: {str(e)}")
         return jsonify({"status": "error", "message": str(e)}), 500
