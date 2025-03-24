@@ -1,4 +1,4 @@
-fastapi
-uvicorn
+flask
+flask_cors
 requests
 python-dotenv

@@ -1,23 +1,16 @@
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 from dotenv import load_dotenv
 import requests
 import os
 import tempfile
+import time
 
 # Load environment variables from .env file
 load_dotenv()
 
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = Flask(__name__)
+CORS(app)  # Enable CORS for all domains
 
 # Configuration
 CHATWOOT_ADMIN_API_TOKEN = os.getenv("CHATWOOT_ADMIN_API_TOKEN")
@@ -55,7 +48,7 @@ class ChatwootBotpressBridge:
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
-            raise HTTPException(status_code=500, detail=f"Botpress API error: {str(e)}")
+            raise Exception(f"Botpress API error: {str(e)}")
 
     @staticmethod
     def send_to_chatwoot(conversation_id, message):
@@ -69,7 +62,7 @@ class ChatwootBotpressBridge:
             response.raise_for_status()
             return True
         except requests.exceptions.RequestException as e:
-            raise HTTPException(status_code=500, detail=f"Chatwoot API error: {str(e)}")
+            raise Exception(f"Chatwoot API error: {str(e)}")
 
     @staticmethod
     def update_conversation_status(conversation_id, status="open"):
@@ -83,7 +76,7 @@ class ChatwootBotpressBridge:
             response.raise_for_status()
             return True
         except requests.exceptions.RequestException as e:
-            raise HTTPException(status_code=500, detail=f"Chatwoot conversation update error: {str(e)}")
+            raise Exception(f"Chatwoot conversation update error: {str(e)}")
 
     @staticmethod
     def assign_conversation_to_bot(conversation_id):
@@ -97,7 +90,7 @@ class ChatwootBotpressBridge:
             response.raise_for_status()
             return True
         except requests.exceptions.RequestException as e:
-            raise HTTPException(status_code=500, detail=f"Chatwoot assignment update error: {str(e)}")
+            raise Exception(f"Chatwoot assignment update error: {str(e)}")
 
     @staticmethod
     def get_available_human_agent():
@@ -111,11 +104,11 @@ class ChatwootBotpressBridge:
             response.raise_for_status()
             members = response.json().get("payload", [])
             if not members:
-                raise HTTPException(status_code=500, detail="No inbox members found")
+                raise Exception("No inbox members found")
             last_assigned_agent_index = (last_assigned_agent_index + 1) % len(members)
             return members[last_assigned_agent_index].get("id")
         except requests.exceptions.RequestException as e:
-            raise HTTPException(status_code=500, detail=f"Error fetching inbox members: {str(e)}")
+            raise Exception(f"Error fetching inbox members: {str(e)}")
 
     @staticmethod
     def assign_conversation_to_human(conversation_id):
@@ -124,7 +117,7 @@ class ChatwootBotpressBridge:
         """
         human_agent_id = ChatwootBotpressBridge.get_available_human_agent()
         if human_agent_id is None:
-            raise HTTPException(status_code=500, detail="No available human agent found")
+            raise Exception("No available human agent found")
         try:
             assignment_url = f"{CHATWOOT_BASE_URL}/api/v1/accounts/{CHATWOOT_ACCOUNT_ID}/conversations/{conversation_id}/assignments"
             payload = {"assignee_id": human_agent_id}
@@ -132,7 +125,7 @@ class ChatwootBotpressBridge:
             response.raise_for_status()
             return True
         except requests.exceptions.RequestException as e:
-            raise HTTPException(status_code=500, detail=f"Chatwoot assignment update error: {str(e)}")
+            raise Exception(f"Chatwoot assignment update error: {str(e)}")
 
     @staticmethod
     def send_attachment_to_chatwoot(conversation_id, file_path, file_name, mime_type="application/octet-stream"):
@@ -140,23 +133,23 @@ class ChatwootBotpressBridge:
         Send a file attachment to Chatwoot using a multipart/form-data request.
         """
         chatwoot_url = f"{CHATWOOT_BASE_URL}/api/v1/accounts/{CHATWOOT_ACCOUNT_ID}/conversations/{conversation_id}/messages"
-        files = {"attachments[]": (file_name, open(file_path, "rb"), mime_type)}
-        data = {"message_type": "outgoing"}
-        headers = {"api_access_token": CHATWOOT_BOT_API_TOKEN}
-        response = requests.post(chatwoot_url, data=data, files=files, headers=headers)
-        response.raise_for_status()
-        return response.json()
-
+        with open(file_path, "rb") as f:
+            files = {"attachments[]": (file_name, f, mime_type)}
+            data = {"message_type": "outgoing"}
+            headers = {"api_access_token": CHATWOOT_BOT_API_TOKEN}
+            response = requests.post(chatwoot_url, data=data, files=files, headers=headers)
+            response.raise_for_status()
+            return response.json()
 
 # Initialize the bridge
 bridge = ChatwootBotpressBridge()
 
-@app.post("/botpress")
-async def chatwoot_webhook(request: Request):
+@app.route("/botpress", methods=["POST"])
+def chatwoot_webhook():
     try:
-        data = await request.json()
+        data = request.get_json()
         if not isinstance(data, dict):
-            raise HTTPException(status_code=400, detail="Invalid data format: expected a JSON object")
+            raise Exception("Invalid data format: expected a JSON object")
 
         message_type = data.get("message_type", "")
         content = data.get("content", "")
@@ -168,7 +161,7 @@ async def chatwoot_webhook(request: Request):
         if data.get("event", "") == "conversation_resolved":
             conversation_id = data.get("id", "")
             bridge.assign_conversation_to_bot(conversation_id)
-            return JSONResponse(content={"status": "success", "message": "Conversation resolved"}, status_code=200)
+            return jsonify({"status": "success", "message": "Conversation resolved"}), 200
 
         # When status is pending, update it to open
         if conversation.get("status", "") == "pending":
@@ -181,16 +174,15 @@ async def chatwoot_webhook(request: Request):
             # Check if the Botpress response contains file attachment(s)
             if isinstance(bot_response, dict) and bot_response.get("responses"):
                 bp_resp = bot_response["responses"][0]
-                if bp_resp.get("type") == "file":
-                    file_url = bp_resp.get("file")
+                if bp_resp.get("type") in ["file", "image", "audio", "video"]:
+                    file_url = bp_resp.get(bp_resp.get("type"))
                     title = bp_resp.get("title", "attachment")
                     # Download the file from Botpress
                     file_download = requests.get(file_url)
                     if file_download.status_code != 200:
-                        raise HTTPException(status_code=500, detail="Failed to download file from Botpress")
+                        raise Exception("Failed to download file from Botpress")
                     file_content = file_download.content
                     mime_type = file_download.headers.get("Content-Type", "application/octet-stream")
-                    # Determine filename from URL (or you could use title and extension)
                     filename = os.path.basename(file_url)
                     # Write file content to a temporary file
                     with tempfile.NamedTemporaryFile(delete=False) as tmp:
@@ -200,7 +192,7 @@ async def chatwoot_webhook(request: Request):
                     # Send the downloaded file as an attachment to Chatwoot
                     bridge.send_attachment_to_chatwoot(conversation_id, temp_file_path, filename, mime_type)
                     os.remove(temp_file_path)
-                    return JSONResponse(content={"status": "success", "message": "Attachment sent successfully"}, status_code=200)
+                    return jsonify({"status": "success", "message": "Attachment sent successfully"}), 200
                 else:
                     # Handle non-file (text) response from Botpress
                     bot_text = bp_resp.get("text")
@@ -208,31 +200,30 @@ async def chatwoot_webhook(request: Request):
                         handoff_message = "Please wait while I connect you to a human agent"
                         if bridge.send_to_chatwoot(conversation_id, handoff_message):
                             if bridge.assign_conversation_to_human(conversation_id):
-                                return JSONResponse(content={"status": "success", "message": "Handoff processed successfully"}, status_code=200)
+                                return jsonify({"status": "success", "message": "Handoff processed successfully"}), 200
                             else:
-                                raise HTTPException(status_code=500, detail="Failed to update conversation assignment")
+                                raise Exception("Failed to update conversation assignment")
                         else:
-                            raise HTTPException(status_code=500, detail="Failed to send handoff message")
+                            raise Exception("Failed to send handoff message")
                     if not bot_text:
-                        raise HTTPException(status_code=500, detail="Failed to get Botpress response")
+                        raise Exception("Failed to get Botpress response")
                     if bridge.send_to_chatwoot(conversation_id, bot_text):
-                        return JSONResponse(content={"status": "success", "message": "Message processed successfully"}, status_code=200)
+                        return jsonify({"status": "success", "message": "Message processed successfully"}), 200
                     else:
-                        raise HTTPException(status_code=500, detail="Failed to send message to Chatwoot")
+                        raise Exception("Failed to send message to Chatwoot")
             else:
-                raise HTTPException(status_code=500, detail="Invalid Botpress response format")
+                raise Exception("Invalid Botpress response format")
         else:
             # Ignore outgoing or non-user messages
-            return JSONResponse(content={"status": "ignored", "reason": "not an incoming message"}, status_code=200)
+            return jsonify({"status": "ignored", "reason": "not an incoming message"}), 200
 
     except Exception as e:
-        return JSONResponse(content={"status": "error", "message": str(e)}, status_code=500)
+        return jsonify({"status": "error", "message": str(e)}), 500
 
-@app.get("/health")
-async def health_check():
-    return JSONResponse(content={"status": "healthy"}, status_code=200)
+@app.route("/health", methods=["GET"])
+def health_check():
+    return jsonify({"status": "healthy"}), 200
 
 if __name__ == "__main__":
-    import uvicorn
     port = int(os.getenv("PORT", 3100))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port)
